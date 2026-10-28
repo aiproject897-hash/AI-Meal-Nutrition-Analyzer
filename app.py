@@ -1,34 +1,40 @@
 
-import json
 import os
+import json
 import time
 import base64
 import io
 
+import streamlit as st
+import requests
 import pandas as pd
 import plotly.express as px
-import requests
-import streamlit as st
 from PIL import Image, ImageOps
 
 st.set_page_config(
-    page_title="NutriLens",
+    page_title="NutriLens - Meal Nutrition Analyzer",
     page_icon="🥗",
     layout="wide",
 )
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent"
+)
 
 st.title("🥗 NutriLens")
 st.subheader("AI Meal Nutrition Analyzer")
-st.write("Enter a meal description or upload a meal photo.")
+st.write("Enter a meal description or upload a photo to estimate nutrition.")
 
 with st.sidebar:
     st.header("Settings")
-    model_name = st.text_input("Gemini model", value=DEFAULT_MODEL).strip()
-    st.caption("Use a model supported by your Gemini API key.")
-    st.caption("Nutrition values are estimates, not medical advice.")
+    model_name = st.text_input(
+        "Gemini model",
+        value=DEFAULT_MODEL,
+    ).strip()
+    st.caption("Choose a model supported by your API key.")
+    st.caption("Nutrition values are estimates only.")
 
 
 def get_api_key():
@@ -45,15 +51,14 @@ def call_gemini(prompt, api_key, model, image=None):
     if image is not None:
         image = ImageOps.exif_transpose(image).convert("RGB")
         image.thumbnail((768, 768))
-
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=82, optimize=True)
-        encoded_image = base64.b64encode(buffer.getvalue()).decode("ascii")
+        image.save(buffer, format="JPEG", quality=82)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
 
         parts.append({
             "inline_data": {
                 "mime_type": "image/jpeg",
-                "data": encoded_image,
+                "data": encoded,
             }
         })
 
@@ -85,75 +90,71 @@ def call_gemini(prompt, api_key, model, image=None):
 
             if response.status_code in (408, 429, 500, 502, 503, 504):
                 if attempt < 3:
-                    wait = 2 ** (attempt + 1)
+                    delay = 2 ** (attempt + 1)
                     st.warning(
-                        f"Gemini is temporarily busy. "
-                        f"Retrying in {wait} seconds "
+                        f"Gemini is busy. Retrying in {delay} seconds "
                         f"(attempt {attempt + 2}/4)."
                     )
-                    time.sleep(wait)
+                    time.sleep(delay)
                     continue
 
             try:
-                details = response.json().get("error", {}).get(
-                    "message", response.text[:500]
-                )
+                message = response.json().get(
+                    "error", {}
+                ).get("message", response.text[:500])
             except ValueError:
-                details = response.text[:500]
+                message = response.text[:500]
 
             if response.status_code == 503:
                 raise RuntimeError(
-                    "Gemini is overloaded after several attempts. "
-                    "Wait a few minutes or try another supported model. "
-                    + details
+                    "Gemini is overloaded. Wait a few minutes or select "
+                    "another supported model. Details: " + message
                 )
 
             if response.status_code == 429:
                 raise RuntimeError(
                     "Gemini rate limit or quota reached. Check your API "
-                    "quota and billing. " + details
+                    "quota and billing. Details: " + message
                 )
 
             if response.status_code == 404:
                 raise RuntimeError(
-                    f"The model '{model}' is unavailable or not found. "
-                    "Choose a supported model in the sidebar. " + details
+                    f"Model '{model}' is unavailable. Choose a supported "
+                    "model in the sidebar. Details: " + message
                 )
 
             raise RuntimeError(
-                f"Gemini API returned HTTP {response.status_code}: {details}"
+                f"Gemini API error {response.status_code}: {message}"
             )
 
         except requests.exceptions.Timeout as exc:
             if attempt < 3:
-                wait = 2 ** (attempt + 1)
-                st.warning(
-                    f"Request timed out. Retrying in {wait} seconds."
-                )
-                time.sleep(wait)
+                delay = 2 ** (attempt + 1)
+                st.warning(f"Request timed out. Retrying in {delay} seconds.")
+                time.sleep(delay)
                 continue
-
             raise RuntimeError(
-                "Gemini did not respond in time. Please try again later."
+                "Gemini did not respond in time. Try again later."
             ) from exc
 
         except requests.exceptions.RequestException as exc:
             if attempt < 3:
                 time.sleep(2 ** (attempt + 1))
                 continue
-
-            raise RuntimeError(
-                f"Could not connect to Gemini: {exc}"
-            ) from exc
+            raise RuntimeError(f"Connection error: {exc}") from exc
 
     if response is None or not response.ok:
         raise RuntimeError("Gemini could not complete the request.")
 
     try:
         data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise ValueError("Gemini returned no answer.")
+
         output = "".join(
             part.get("text", "")
-            for part in data["candidates"][0]["content"]["parts"]
+            for part in candidates[0].get("content", {}).get("parts", [])
         ).strip()
 
         if output.startswith("```"):
@@ -161,25 +162,27 @@ def call_gemini(prompt, api_key, model, image=None):
             if output.lower().startswith("json"):
                 output = output[4:].strip()
 
-        return json.loads(output)
+        result = json.loads(output)
+        if not isinstance(result, dict):
+            raise ValueError("Expected a JSON object.")
+        return result
 
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(
-            "Gemini returned an unreadable response. Please try again."
+            "Could not read Gemini's response. Please try again."
         ) from exc
 
 
 def analyze_meal(description, api_key, model, image=None):
     prompt = f"""
-Estimate the nutrition of this meal.
-
-Return ONLY valid JSON in this format:
+Estimate the nutrition in the meal described or shown in the image.
+Return ONLY valid JSON in this exact structure:
 {{
   "meal_name": "Meal name",
-  "summary": "Brief explanation of the meal",
+  "summary": "Brief explanation and uncertainty",
   "items": [
     {{
-      "name": "Food name",
+      "name": "Food item",
       "portion": "Estimated portion",
       "calories": 100,
       "protein_g": 5,
@@ -193,16 +196,16 @@ Return ONLY valid JSON in this format:
 }}
 
 Rules:
-- Use realistic nutrition estimates.
-- Use numeric, non-negative nutrition values.
-- Include each identifiable food and drink.
-- State portion-size assumptions.
-- Do not claim estimates are exact.
-- If the meal is unclear, explain the uncertainty.
-- Return an empty items list if no food can be identified.
+- Nutrition values must be numeric and non-negative.
+- Estimate realistic portions.
+- Include identifiable foods, drinks, toppings, and sauces.
+- Explain uncertainty; do not claim exact accuracy.
+- If no food is identifiable, return an empty items list.
+- Do not diagnose medical conditions.
+- Return JSON only, without Markdown fences.
 
-User's meal description:
-{description or "Analyze the attached meal photo."}
+Meal description:
+{description.strip() if description.strip() else "Analyze the attached meal photo."}
 """
     return call_gemini(prompt, api_key, model, image)
 
@@ -210,59 +213,61 @@ User's meal description:
 api_key = get_api_key()
 
 if not api_key:
-    st.warning("Your Gemini API key is not configured.")
+    st.warning("Gemini API key is not configured.")
     st.markdown(
-        "Create a key at "
-        "[Google AI Studio](https://aistudio.google.com/apikey)."
+        "Get a key at [Google AI Studio]"
+        "(https://aistudio.google.com/apikey), then add it to Streamlit Secrets."
     )
-    st.write("Then add it to Streamlit Secrets:")
-    st.code('GEMINI_API_KEY = "your_actual_api_key"', language="toml")
+    st.code('GEMINI_API_KEY = "YOUR_REAL_API_KEY"', language="toml")
+    st.caption("Keep your API key private. Do not commit it to GitHub.")
 
-description = st.text_area(
-    "Describe your meal",
-    placeholder=(
-        "Example: 2 boiled eggs, 2 slices of whole-wheat bread, "
-        "and a cup of tea with milk and sugar."
-    ),
-    height=110,
-)
+with st.form("meal_form"):
+    description = st.text_area(
+        "Describe your meal",
+        placeholder=(
+            "Example: 2 boiled eggs, 2 slices of bread, "
+            "and a cup of tea with milk and sugar."
+        ),
+        height=120,
+    )
 
-uploaded_file = st.file_uploader(
-    "Or upload a meal photo (optional)",
-    type=["png", "jpg", "jpeg", "webp"],
-)
+    uploaded_file = st.file_uploader(
+        "Upload a meal photo (optional)",
+        type=["png", "jpg", "jpeg", "webp"],
+    )
+
+    submitted = st.form_submit_button(
+        "Analyze meal",
+        type="primary",
+        use_container_width=True,
+    )
 
 image = None
-
 if uploaded_file is not None:
     try:
         image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded meal", width=320)
+        st.image(image, caption="Uploaded meal", width=350)
     except Exception:
-        st.error("Could not open this image. Please upload another one.")
+        st.error("Could not open this image.")
         image = None
 
-if st.button("Analyze meal", type="primary", use_container_width=True):
+if submitted:
     if not api_key:
-        st.error("Configure your Gemini API key first.")
-
+        st.error("Add your Gemini API key to Streamlit Secrets first.")
     elif not description.strip() and image is None:
         st.error("Enter a meal description or upload a photo.")
-
     elif not model_name:
         st.error("Enter a Gemini model name in the sidebar.")
-
     else:
         try:
             with st.spinner("Analyzing your meal..."):
                 result = analyze_meal(
-                    description.strip(),
+                    description,
                     api_key,
                     model_name,
                     image,
                 )
                 st.session_state["nutrilens_result"] = result
-
         except Exception as exc:
             st.error(str(exc))
 
@@ -276,44 +281,42 @@ if result:
     items = result.get("items", [])
 
     if not isinstance(items, list) or not items:
-        st.info("No food items were identified. Add more meal details.")
-
+        st.info("No food items identified. Please add more details.")
     else:
         df = pd.DataFrame(items)
 
-        numeric_columns = [
+        for col in ["name", "portion"]:
+            if col not in df.columns:
+                df[col] = ""
+
+        numeric_cols = [
             "calories", "protein_g", "carbs_g", "fat_g", "fiber_g"
         ]
 
-        for column in numeric_columns:
-            if column not in df.columns:
-                df[column] = 0
-
-            df[column] = (
-                pd.to_numeric(df[column], errors="coerce")
+        for col in numeric_cols:
+            if col not in df.columns:
+                df[col] = 0
+            df[col] = (
+                pd.to_numeric(df[col], errors="coerce")
                 .fillna(0)
                 .clip(lower=0)
             )
 
-        for column in ["name", "portion"]:
-            if column not in df.columns:
-                df[column] = ""
+        calories = float(df["calories"].sum())
+        protein = float(df["protein_g"].sum())
+        carbs = float(df["carbs_g"].sum())
+        fat = float(df["fat_g"].sum())
+        fiber = float(df["fiber_g"].sum())
 
-        calories = df["calories"].sum()
-        protein = df["protein_g"].sum()
-        carbs = df["carbs_g"].sum()
-        fat = df["fat_g"].sum()
-        fiber = df["fiber_g"].sum()
-
-        c1, c2, c3, c4 = st.columns(4)
+        st.subheader("Nutrition totals")
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Calories", f"{calories:.0f} kcal")
         c2.metric("Protein", f"{protein:.1f} g")
         c3.metric("Carbs", f"{carbs:.1f} g")
         c4.metric("Fat", f"{fat:.1f} g")
+        c5.metric("Fiber", f"{fiber:.1f} g")
 
-        st.subheader("Nutrition by food item")
-
-        columns = {
+        labels = {
             "name": "Food",
             "portion": "Estimated portion",
             "calories": "Calories (kcal)",
@@ -323,21 +326,21 @@ if result:
             "fiber_g": "Fiber (g)",
         }
 
-        report_df = df[list(columns)].rename(columns=columns)
+        report_df = df[list(labels)].rename(columns=labels)
 
+        st.subheader("Nutrition by food item")
         st.dataframe(
             report_df,
             use_container_width=True,
             hide_index=True,
         )
 
-        st.subheader("Macronutrients")
-
         chart_df = pd.DataFrame({
             "Macronutrient": ["Protein", "Carbohydrates", "Fat"],
             "Grams": [protein, carbs, fat],
         })
 
+        st.subheader("Macronutrient chart")
         st.plotly_chart(
             px.bar(
                 chart_df,
@@ -349,15 +352,14 @@ if result:
         )
 
         advice = result.get("advice", [])
-
-        if advice:
+        if isinstance(advice, list) and advice:
             st.subheader("Suggestions")
             for tip in advice:
                 st.write(f"- {tip}")
 
         st.caption(
-            f"Confidence: {result.get('confidence', 'Unspecified')}. "
-            "Nutrition figures are estimates only."
+            f"Confidence: {result.get('confidence', 'Not specified')}. "
+            "Values are estimates only."
         )
 
         csv_data = report_df.to_csv(index=False).encode("utf-8")
@@ -365,9 +367,9 @@ if result:
             result, indent=2, ensure_ascii=False
         ).encode("utf-8")
 
-        d1, d2 = st.columns(2)
+        col1, col2 = st.columns(2)
 
-        d1.download_button(
+        col1.download_button(
             "Download CSV report",
             data=csv_data,
             file_name="nutrilens_report.csv",
@@ -375,10 +377,15 @@ if result:
             use_container_width=True,
         )
 
-        d2.download_button(
+        col2.download_button(
             "Download JSON report",
             data=json_data,
             file_name="nutrilens_report.json",
             mime="application/json",
             use_container_width=True,
         )
+
+st.divider()
+st.caption(
+    "Nutrition estimates are for general information and are not medical advice."
+)
