@@ -6,11 +6,16 @@ from datetime import date
 from math import isfinite
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 from google import genai
 from google.genai import types
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+# Plotly is optional: the app can use Streamlit's chart if it is unavailable.
+try:
+    import plotly.express as px
+except ImportError:
+    px = None
 
 
 st.set_page_config(
@@ -23,8 +28,12 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 NUTRIENTS = [
-    "calories", "protein_g", "carbs_g",
-    "fat_g", "fiber_g", "sugar_g",
+    "calories",
+    "protein_g",
+    "carbs_g",
+    "fat_g",
+    "fiber_g",
+    "sugar_g",
 ]
 
 LABELS = {
@@ -38,45 +47,55 @@ LABELS = {
 
 
 def get_setting(name, default=""):
-    """Read configuration from Streamlit secrets or environment."""
+    """Read settings from Streamlit secrets or environment variables."""
     try:
         value = st.secrets.get(name)
         if value:
             return str(value)
     except Exception:
         pass
+
     return os.getenv(name, default)
 
 
 def get_client():
     api_key = get_setting("GEMINI_API_KEY")
+
     if not api_key:
         raise ValueError(
-            "GEMINI_API_KEY is missing. Configure it in "
-            ".streamlit/secrets.toml or Streamlit Cloud Secrets."
+            "GEMINI_API_KEY is missing. Add it to Streamlit Cloud Secrets "
+            "or .streamlit/secrets.toml for local development."
         )
+
     return genai.Client(api_key=api_key)
 
 
 def safe_number(value):
+    """Return a finite, non-negative numeric value."""
     try:
         number = float(value)
+
         if not isfinite(number) or number < 0:
             return 0.0
+
         return round(number, 2)
+
     except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
 def normalize_report(data):
+    """Validate and normalize the JSON returned by Gemini."""
     if not isinstance(data, dict):
-        raise ValueError("The AI response is not a JSON object.")
+        raise ValueError("The AI response was not a JSON object.")
 
     raw_foods = data.get("foods", [])
+
     if not isinstance(raw_foods, list):
         raw_foods = []
 
     foods = []
+
     for item in raw_foods:
         if not isinstance(item, dict):
             continue
@@ -94,22 +113,25 @@ def normalize_report(data):
         foods.append(food)
 
     raw_totals = data.get("totals", {})
+
     if not isinstance(raw_totals, dict):
         raw_totals = {}
 
-    # Prefer totals calculated from individual food items.
     if foods:
         totals = {
-            n: round(sum(f[n] for f in foods), 2)
-            for n in NUTRIENTS
+            nutrient: round(
+                sum(food[nutrient] for food in foods), 2
+            )
+            for nutrient in NUTRIENTS
         }
     else:
         totals = {
-            n: safe_number(raw_totals.get(n, 0))
-            for n in NUTRIENTS
+            nutrient: safe_number(raw_totals.get(nutrient, 0))
+            for nutrient in NUTRIENTS
         }
 
     assumptions = data.get("assumptions", [])
+
     if not isinstance(assumptions, list):
         assumptions = [str(assumptions)]
 
@@ -119,11 +141,14 @@ def normalize_report(data):
         "summary": str(
             data.get("summary", "No summary available.")
         )[:2000],
-        "assumptions": [str(x)[:500] for x in assumptions[:10]],
+        "assumptions": [
+            str(item)[:500] for item in assumptions[:10]
+        ],
     }
 
 
 def analyze_meal(description, image, meal_type, model):
+    """Use Gemini to estimate nutrition from text and/or a meal image."""
     client = get_client()
 
     prompt = f"""
@@ -133,7 +158,7 @@ Meal category: {meal_type}
 User description: {description or "Not provided"}
 
 Analyze the supplied text and/or image. Return valid JSON only,
-using this exact structure:
+using this shape:
 
 {{
   "foods": [
@@ -162,11 +187,10 @@ using this exact structure:
 
 Rules:
 - Estimate each identifiable food separately.
-- Use realistic approximate portions.
+- Use realistic approximate portions and non-negative values.
+- Totals should approximately equal the sum of the food items.
 - Do not claim a photo reveals exact weights or hidden ingredients.
-- Mention uncertainty about oils, sauces, and preparation.
-- Use non-negative numeric nutrient values.
-- Totals should approximately equal the sum of food items.
+- Mention uncertainty about oils, sauces, ingredients, and preparation.
 - If the image is unclear, state that limitation.
 - Do not give medical diagnoses or invent exact measurements.
 - Return JSON without Markdown fences.
@@ -177,6 +201,7 @@ Rules:
     if image is not None:
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=90)
+
         contents.append(
             types.Part.from_bytes(
                 data=buffer.getvalue(),
@@ -205,16 +230,25 @@ Rules:
 
 
 def sum_meals(meals):
-    totals = {n: 0.0 for n in NUTRIENTS}
+    """Calculate totals across all meals for a selected date."""
+    totals = {
+        nutrient: 0.0 for nutrient in NUTRIENTS
+    }
 
     for meal in meals:
         for nutrient in NUTRIENTS:
-            totals[nutrient] += meal["report"]["totals"][nutrient]
+            totals[nutrient] += (
+                meal["report"]["totals"][nutrient]
+            )
 
-    return {n: round(v, 2) for n, v in totals.items()}
+    return {
+        nutrient: round(value, 2)
+        for nutrient, value in totals.items()
+    }
 
 
 def make_csv(meals):
+    """Convert recorded meals into a downloadable CSV."""
     rows = []
 
     for meal in meals:
@@ -225,16 +259,27 @@ def make_csv(meals):
                 "food": food["name"],
                 "portion": food["portion"],
             }
-            for n in NUTRIENTS:
-                row[LABELS[n]] = food[n]
+
+            for nutrient in NUTRIENTS:
+                row[LABELS[nutrient]] = food[nutrient]
+
             rows.append(row)
 
-    columns = ["date", "meal", "food", "portion"] + [
-        LABELS[n] for n in NUTRIENTS
+    columns = [
+        "date",
+        "meal",
+        "food",
+        "portion",
+    ] + [
+        LABELS[nutrient] for nutrient in NUTRIENTS
     ]
-    return pd.DataFrame(rows, columns=columns).to_csv(index=False)
+
+    return pd.DataFrame(
+        rows, columns=columns
+    ).to_csv(index=False)
 
 
+# Initialize temporary session data.
 if "meals" not in st.session_state:
     st.session_state.meals = []
 
@@ -242,6 +287,7 @@ if "latest_report" not in st.session_state:
     st.session_state.latest_report = None
 
 
+# Sidebar.
 with st.sidebar:
     st.title("🥗 NutriLens")
     st.caption("AI meal nutrition estimates")
@@ -252,17 +298,24 @@ with st.sidebar:
         help="Use a model supported by your Gemini API key.",
     ).strip()
 
-    st.metric("Meals in this session", len(st.session_state.meals))
+    st.metric(
+        "Meals in this session",
+        len(st.session_state.meals),
+    )
 
     if st.button("Clear session history"):
         st.session_state.meals = []
         st.session_state.latest_report = None
         st.rerun()
 
-    st.caption("History is temporary and may disappear after a session reset.")
+    st.caption(
+        "History is temporary and may disappear after a session reset."
+    )
 
 
+# Main page.
 st.title("AI Meal Nutrition Analyzer")
+
 st.write(
     "Describe your meal or upload a photo to estimate calories, "
     "protein, carbohydrates, fats, fiber, and sugar."
@@ -274,16 +327,26 @@ st.warning(
 )
 
 analyze_tab, daily_tab, about_tab = st.tabs(
-    ["🍽️ Analyze meal", "📊 Daily report", "ℹ️ About"]
+    [
+        "🍽️ Analyze meal",
+        "📊 Daily report",
+        "ℹ️ About",
+    ]
 )
 
+
+# Meal analysis tab.
 with analyze_tab:
     with st.form("meal_form"):
         meal_type = st.selectbox(
             "Meal type",
             ["Breakfast", "Lunch", "Dinner", "Snack", "Other"],
         )
-        meal_date = st.date_input("Meal date", value=date.today())
+
+        meal_date = st.date_input(
+            "Meal date",
+            value=date.today(),
+        )
 
         description = st.text_area(
             "What did you eat?",
@@ -314,16 +377,34 @@ with analyze_tab:
                 image = Image.open(uploaded_file)
                 image = ImageOps.exif_transpose(image).convert("RGB")
                 image.thumbnail((1600, 1600))
-                st.image(image, caption="Uploaded meal", width=400)
-            except (UnidentifiedImageError, OSError, ValueError):
-                st.error("Could not read this image. Try another file.")
+
+                st.image(
+                    image,
+                    caption="Uploaded meal",
+                    width=400,
+                )
+
+            except (
+                UnidentifiedImageError,
+                OSError,
+                ValueError,
+            ):
+                st.error(
+                    "Could not read this image. Try another file."
+                )
                 image = None
 
     if submitted:
         if not description.strip() and image is None:
-            st.warning("Describe your meal or upload a valid photo.")
+            st.warning(
+                "Describe your meal or upload a valid photo."
+            )
+
         elif not model:
-            st.error("Enter a Gemini model name in the sidebar.")
+            st.error(
+                "Enter a Gemini model name in the sidebar."
+            )
+
         else:
             try:
                 with st.spinner("Analyzing your meal..."):
@@ -343,12 +424,13 @@ with analyze_tab:
 
                 st.session_state.meals.append(record)
                 st.session_state.latest_report = record
+
                 st.success("Nutrition report generated.")
 
             except Exception as exc:
                 st.error(
-                    "Analysis failed. Check your API key, model access, "
-                    "internet connection, and API limits."
+                    "Analysis failed. Check your Gemini API key, "
+                    "model access, internet connection, and API limits."
                 )
                 st.caption(f"Technical details: {exc}")
 
@@ -359,21 +441,37 @@ with analyze_tab:
         totals = report["totals"]
 
         st.divider()
-        st.subheader(f"{latest['meal_type']} nutrition report")
+        st.subheader(
+            f"{latest['meal_type']} nutrition report"
+        )
         st.caption(f"Date: {latest['date']}")
 
         cols = st.columns(3)
-        cols[0].metric("Calories", f"{totals['calories']:.0f} kcal")
-        cols[1].metric("Protein", f"{totals['protein_g']:.1f} g")
-        cols[2].metric("Carbs", f"{totals['carbs_g']:.1f} g")
+        cols[0].metric(
+            "Calories", f"{totals['calories']:.0f} kcal"
+        )
+        cols[1].metric(
+            "Protein", f"{totals['protein_g']:.1f} g"
+        )
+        cols[2].metric(
+            "Carbs", f"{totals['carbs_g']:.1f} g"
+        )
 
         cols = st.columns(3)
-        cols[0].metric("Fat", f"{totals['fat_g']:.1f} g")
-        cols[1].metric("Fiber", f"{totals['fiber_g']:.1f} g")
-        cols[2].metric("Sugar", f"{totals['sugar_g']:.1f} g")
+        cols[0].metric(
+            "Fat", f"{totals['fat_g']:.1f} g"
+        )
+        cols[1].metric(
+            "Fiber", f"{totals['fiber_g']:.1f} g"
+        )
+        cols[2].metric(
+            "Sugar", f"{totals['sugar_g']:.1f} g"
+        )
 
         if report["foods"]:
-            food_df = pd.DataFrame(report["foods"]).rename(
+            food_df = pd.DataFrame(
+                report["foods"]
+            ).rename(
                 columns={
                     "name": "Food",
                     "portion": "Estimated portion",
@@ -387,44 +485,81 @@ with analyze_tab:
             )
 
             st.subheader("Food breakdown")
-            st.dataframe(food_df, use_container_width=True, hide_index=True)
 
-            macro_df = pd.DataFrame({
-                "Nutrient": ["Protein", "Carbohydrates", "Fat"],
-                "Grams": [
-                    totals["protein_g"],
-                    totals["carbs_g"],
-                    totals["fat_g"],
-                ],
-            })
+            st.dataframe(
+                food_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            macro_df = pd.DataFrame(
+                {
+                    "Nutrient": [
+                        "Protein",
+                        "Carbohydrates",
+                        "Fat",
+                    ],
+                    "Grams": [
+                        totals["protein_g"],
+                        totals["carbs_g"],
+                        totals["fat_g"],
+                    ],
+                }
+            )
 
             st.subheader("Macronutrients")
-            fig = px.bar(
-                macro_df,
-                x="Nutrient",
-                y="Grams",
-                color="Nutrient",
-                text="Grams",
-            )
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+
+            if px is not None:
+                fig = px.bar(
+                    macro_df,
+                    x="Nutrient",
+                    y="Grams",
+                    color="Nutrient",
+                    text="Grams",
+                )
+
+                fig.update_layout(showlegend=False)
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                )
+
+            else:
+                st.info(
+                    "Plotly is not installed; "
+                    "showing a basic chart instead."
+                )
+
+                st.bar_chart(
+                    macro_df.set_index("Nutrient")
+                )
 
         st.subheader("Nutrition summary")
         st.write(report["summary"])
 
         if report["assumptions"]:
-            with st.expander("Assumptions and uncertainties"):
+            with st.expander(
+                "Assumptions and uncertainties"
+            ):
                 for item in report["assumptions"]:
                     st.write(f"- {item}")
 
         st.download_button(
             "Download meal report (JSON)",
-            data=json.dumps(latest, indent=2, ensure_ascii=False),
-            file_name=f"{latest['meal_type'].lower()}_report.json",
+            data=json.dumps(
+                latest,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            file_name=(
+                f"{latest['meal_type'].lower()}_report.json"
+            ),
             mime="application/json",
         )
 
 
+# Daily report tab.
 with daily_tab:
     selected_date = st.date_input(
         "Choose report date",
@@ -433,35 +568,58 @@ with daily_tab:
     )
 
     daily_meals = [
-        m for m in st.session_state.meals
-        if m["date"] == selected_date.isoformat()
+        meal
+        for meal in st.session_state.meals
+        if meal["date"] == selected_date.isoformat()
     ]
 
     if not daily_meals:
-        st.info("No meals recorded for this date in this session.")
+        st.info(
+            "No meals recorded for this date in this session."
+        )
+
     else:
         totals = sum_meals(daily_meals)
 
         cols = st.columns(3)
-        cols[0].metric("Calories", f"{totals['calories']:.0f} kcal")
-        cols[1].metric("Protein", f"{totals['protein_g']:.1f} g")
-        cols[2].metric("Carbohydrates", f"{totals['carbs_g']:.1f} g")
+        cols[0].metric(
+            "Calories", f"{totals['calories']:.0f} kcal"
+        )
+        cols[1].metric(
+            "Protein", f"{totals['protein_g']:.1f} g"
+        )
+        cols[2].metric(
+            "Carbohydrates", f"{totals['carbs_g']:.1f} g"
+        )
 
         cols = st.columns(3)
-        cols[0].metric("Fat", f"{totals['fat_g']:.1f} g")
-        cols[1].metric("Fiber", f"{totals['fiber_g']:.1f} g")
-        cols[2].metric("Sugar", f"{totals['sugar_g']:.1f} g")
+        cols[0].metric(
+            "Fat", f"{totals['fat_g']:.1f} g"
+        )
+        cols[1].metric(
+            "Fiber", f"{totals['fiber_g']:.1f} g"
+        )
+        cols[2].metric(
+            "Sugar", f"{totals['sugar_g']:.1f} g"
+        )
 
         meal_rows = []
+
         for meal in daily_meals:
             row = {"Meal": meal["meal_type"]}
-            row.update({
-                LABELS[n]: meal["report"]["totals"][n]
-                for n in NUTRIENTS
-            })
+
+            row.update(
+                {
+                    LABELS[nutrient]:
+                    meal["report"]["totals"][nutrient]
+                    for nutrient in NUTRIENTS
+                }
+            )
+
             meal_rows.append(row)
 
         st.subheader("Meal summary")
+
         st.dataframe(
             pd.DataFrame(meal_rows),
             use_container_width=True,
@@ -471,7 +629,9 @@ with daily_tab:
         st.download_button(
             "Download daily report (CSV)",
             data=make_csv(daily_meals),
-            file_name=f"nutrition_{selected_date.isoformat()}.csv",
+            file_name=(
+                f"nutrition_{selected_date.isoformat()}.csv"
+            ),
             mime="text/csv",
         )
 
@@ -483,19 +643,27 @@ with daily_tab:
 
         st.download_button(
             "Download daily report (JSON)",
-            data=json.dumps(daily_report, indent=2, ensure_ascii=False),
-            file_name=f"nutrition_{selected_date.isoformat()}.json",
+            data=json.dumps(
+                daily_report,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            file_name=(
+                f"nutrition_{selected_date.isoformat()}.json"
+            ),
             mime="application/json",
         )
 
 
+# About tab.
 with about_tab:
     st.subheader("About NutriLens")
+
     st.markdown(
         """
         - Enter a meal description, upload a photo, or use both.
-        - Gemini Flash identifies foods and estimates portions.
-        - The app displays nutrition totals and charts.
+        - Gemini estimates foods, portions, and nutrition values.
+        - View nutrition totals and a macronutrient chart.
         - Add multiple meals to create a daily report.
 
         **Limitations:** Estimates can be inaccurate when portions,
@@ -504,7 +672,8 @@ with about_tab:
         """
     )
 
+
 st.caption(
-    "NutriLens | AI-generated estimates | Verify important "
-    "dietary decisions with reliable nutrition information."
+    "NutriLens | AI-generated estimates | Verify important dietary "
+    "decisions with reliable nutrition information."
 )
