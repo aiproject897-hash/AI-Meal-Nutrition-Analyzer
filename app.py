@@ -26,7 +26,7 @@ API_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/"
     "models/{model}:generateContent"
 )
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 st.markdown(
     """
